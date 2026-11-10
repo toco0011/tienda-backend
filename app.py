@@ -1,5 +1,5 @@
 """Backend de la tienda — Flask + SQLite + API REST."""
-import hmac, os, re, secrets, sqlite3, time
+import os, re, secrets, sqlite3, time
 from functools import wraps
 from flask import Flask, g, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -9,17 +9,30 @@ from werkzeug.security import check_password_hash, generate_password_hash
 # ================== CONFIGURACIÓN (variables de entorno) ==================
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE, "tienda.db"))
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")  # ¡CÁMBIALA en producción!
-ALLOWED = os.environ.get("ALLOWED_ORIGINS", "*")               # ej: https://mitienda.netlify.app
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip().lower()   # correo del administrador
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")              # contraseña inicial (mín. 10 caracteres)
+ADMIN_FORCE_RESET = os.environ.get("ADMIN_FORCE_RESET") == "1"     # 1 = restablece la clave desde ADMIN_PASSWORD
+# Orígenes permitidos, separados por coma. Admite comodín: https://mitienda.netlify.app,https://*.netlify.app
+ALLOWED = os.environ.get("ALLOWED_ORIGINS", "*")
+MIN_PASS = 10
+EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,200}\.[^@\s]{2,}$")
 TOKEN_HORAS = 12
 PUBLIC_KEYS = ("name", "sub", "title", "lead", "tag", "hero", "heroVideo", "theme")
 MAXLEN = {"name": 60, "sub": 120, "title": 120, "lead": 400, "tag": 80}
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024  # 12 MB por petición
-CORS(app,
-     origins="*" if ALLOWED.strip() == "*" else [o.strip() for o in ALLOWED.split(",") if o.strip()],
-     allow_headers=["Content-Type", "Authorization"])
+def cors_origins():
+    if ALLOWED.strip() == "*": return "*"
+    out = []
+    for o in (x.strip().rstrip("/") for x in ALLOWED.split(",")):  # sin "/" final: el navegador no la envía
+        if not o: continue
+        out.append(re.compile("^" + re.escape(o).replace(r"\*", "[a-z0-9-]+") + "$", re.I) if "*" in o else o)
+    return out
+
+CORS(app, supports_credentials=False, resources={r"/api/*": {
+    "origins": cors_origins(), "methods": ["GET", "POST", "DELETE", "OPTIONS"],
+    "allow_headers": ["Content-Type", "Authorization"], "max_age": 86400}})
 
 # ================== BASE DE DATOS ==================
 SCHEMA = """
@@ -30,6 +43,8 @@ CREATE TABLE IF NOT EXISTS productos(
   medidas TEXT NOT NULL, orden INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS temas(
   id TEXT PRIMARY KEY, nombre TEXT NOT NULL, bg TEXT NOT NULL, fg TEXT NOT NULL, ac TEXT NOT NULL, cd TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS admins(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL);
 """
 VID = "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4"
 CH = "S,90,66,43\nM,96,69,45\nL,102,72,47\nXL,108,74,49"  # talla,pecho,largo,hombro (cm)
@@ -57,6 +72,15 @@ def init_db():
         for i, (pid, n, pr, d, img) in enumerate(SEED_PROD):
             con.execute("INSERT OR IGNORE INTO productos VALUES(?,?,?,?,?,?,?,?)", (pid, n, pr, d, img, VID, CH, i))
         con.execute("INSERT INTO config VALUES('seeded','1')")
+    if ADMIN_EMAIL and ADMIN_PASSWORD and EMAIL_RE.match(ADMIN_EMAIL):  # crea el administrador desde las variables
+        fila = con.execute("SELECT id FROM admins ORDER BY id LIMIT 1").fetchone()  # un solo administrador
+        if not fila:  # primera vez (o base reiniciada): se crea desde las variables
+            con.execute("INSERT INTO admins(email,password_hash) VALUES(?,?)", (ADMIN_EMAIL, generate_password_hash(ADMIN_PASSWORD)))
+        elif ADMIN_FORCE_RESET:  # recuperación: fuerza correo y clave de las variables
+            con.execute("UPDATE admins SET email=?, password_hash=? WHERE id=?", (ADMIN_EMAIL, generate_password_hash(ADMIN_PASSWORD), fila[0]))
+        if len(ADMIN_PASSWORD) < MIN_PASS: print(f"⚠ ADMIN_PASSWORD tiene menos de {MIN_PASS} caracteres: cámbiala.")
+    elif not con.execute("SELECT 1 FROM admins").fetchone():
+        print("⚠ No hay administrador: define ADMIN_EMAIL (válido) y ADMIN_PASSWORD para poder iniciar sesión.")
     con.commit(); con.close()
 
 init_db()
@@ -111,42 +135,49 @@ def clean_chart(v):
     return "\n".join(rows)
 
 # ================== AUTENTICACIÓN ==================
-FAILS = {}  # intentos fallidos por IP (en memoria)
+FAILS = {}  # intentos fallidos recientes (en memoria), por IP y por correo
+DUMMY = generate_password_hash("no-existe")  # se compara igual si el correo no existe (no revela cuentas)
 
 def serializer():
     return URLSafeTimedSerializer(os.environ.get("SECRET_KEY") or cfg()["_secret"], salt="admin")
 
-def pwtag():  # cambia al cambiar la contraseña → invalida sesiones viejas
-    return cfg().get("password_hash", "")[-10:]
-
-def new_token():
-    return serializer().dumps({"p": pwtag()})
+def new_token(adm):  # el token lleva el id y una huella de la clave: al cambiarla, las sesiones viejas caducan
+    return serializer().dumps({"id": adm["id"], "p": adm["password_hash"][-10:]})
 
 def admin_required(f):
     @wraps(f)
     def wrapper(*a, **k):
         t = request.headers.get("Authorization", "").replace("Bearer ", "").strip()
-        try:
-            ok = serializer().loads(t, max_age=TOKEN_HORAS * 3600).get("p") == pwtag()
-        except BadSignature:
-            ok = False
-        if not ok: return err("Sesión inválida o expirada", 401)
+        try: data = serializer().loads(t, max_age=TOKEN_HORAS * 3600)
+        except BadSignature: return err("Sesión inválida o expirada", 401)
+        adm = db().execute("SELECT * FROM admins WHERE id=?", (data.get("id"),)).fetchone()
+        if not adm or adm["password_hash"][-10:] != data.get("p"): return err("Sesión inválida o expirada", 401)
+        g.admin = adm
         return f(*a, **k)
     return wrapper
 
+def bloqueado(claves):
+    now, bloq = time.time(), False
+    if len(FAILS) > 5000: FAILS.clear()
+    for k, mx in claves:
+        FAILS[k] = [t for t in FAILS.get(k, []) if now - t < 300]
+        bloq = bloq or len(FAILS[k]) >= mx
+    return bloq
+
 @app.post("/api/admin/login")
 def login():
+    d = request.get_json(silent=True) or {}
+    email, pw = str(d.get("email", "")).strip().lower()[:254], str(d.get("password", ""))[:200]
     ip = request.headers.get("X-Forwarded-For", request.remote_addr or "?").split(",")[0].strip()
-    now = time.time()
-    FAILS[ip] = [t for t in FAILS.get(ip, []) if now - t < 300]
-    if len(FAILS[ip]) >= 5: return err("Demasiados intentos. Espera 5 minutos.", 429)
-    pw = str((request.get_json(silent=True) or {}).get("password", ""))
-    h = cfg().get("password_hash")
-    ok = check_password_hash(h, pw) if h else hmac.compare_digest(pw.encode(), ADMIN_PASSWORD.encode())
+    claves = [("ip:" + ip, 8), ("mail:" + email, 15)]
+    if bloqueado(claves): return err("Demasiados intentos. Espera 5 minutos.", 429)
+    adm = db().execute("SELECT * FROM admins WHERE email=?", (email,)).fetchone() if EMAIL_RE.match(email) else None
+    ok = check_password_hash(adm["password_hash"] if adm else DUMMY, pw) and adm is not None
     if not ok:
-        FAILS[ip].append(now)
-        return err("Contraseña incorrecta", 401)
-    return jsonify({"token": new_token(), "expira_horas": TOKEN_HORAS})
+        for k, _ in claves: FAILS[k].append(time.time())
+        return err("Correo o contraseña incorrectos", 401)
+    for k, _ in claves: FAILS.pop(k, None)
+    return jsonify({"token": new_token(adm), "email": adm["email"], "expira_horas": TOKEN_HORAS})
 
 # ================== API PÚBLICA ==================
 @app.get("/api/tienda")
@@ -200,6 +231,8 @@ def borrar_producto(pid):
 def cambiar_config():
     d, con, token = request.get_json(silent=True) or {}, db(), None
     try:
+        if (d.get("password") or d.get("email")) and not check_password_hash(g.admin["password_hash"], str(d.get("current_password", ""))):
+            raise ValueError("Escribe tu contraseña actual para cambiar el correo o la contraseña")
         for k in PUBLIC_KEYS:
             if k not in d: continue
             v = str(d[k] or "").strip()
@@ -210,15 +243,22 @@ def cambiar_config():
             setcfg(k, v)
         if d.get("password"):
             pw = str(d["password"])
-            if len(pw) < 8: raise ValueError("La contraseña debe tener al menos 8 caracteres")
-            setcfg("password_hash", generate_password_hash(pw))
+            if len(pw) < MIN_PASS or pw.lower() == g.admin["email"]:
+                raise ValueError(f"La contraseña debe tener al menos {MIN_PASS} caracteres y no ser tu correo")
+            con.execute("UPDATE admins SET password_hash=? WHERE id=?", (generate_password_hash(pw), g.admin["id"]))
             token = True
+        if d.get("email"):
+            em = str(d["email"]).strip().lower()
+            if not EMAIL_RE.match(em): raise ValueError("Correo no válido")
+            if con.execute("SELECT 1 FROM admins WHERE email=? AND id<>?", (em, g.admin["id"])).fetchone():
+                raise ValueError("Ese correo ya está en uso")
+            con.execute("UPDATE admins SET email=? WHERE id=?", (em, g.admin["id"]))
     except ValueError as e:
         con.rollback()
         return err(str(e))
     bump(); con.commit()
     out = {"ok": True}
-    if token: out["token"] = new_token()  # sesión nueva tras cambiar la clave
+    if token: out["token"] = new_token(con.execute("SELECT * FROM admins WHERE id=?", (g.admin["id"],)).fetchone())  # sesión nueva
     return jsonify(out)
 
 @app.post("/api/admin/temas")
